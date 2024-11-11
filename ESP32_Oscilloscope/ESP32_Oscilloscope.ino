@@ -2,34 +2,26 @@
 #include <driver/i2s.h>
 #include <driver/adc.h>
 #include <soc/syscon_reg.h>
-#include <TFT_eSPI.h>
 #include <SPI.h>
 #include "esp_adc_cal.h"
 #include "filters.h"
+#include "_constants.h"
+#include "globals.h"
+#include <Adafruit_PCD8544.h>
+#include "Nokia5110DisplayManager.h"
+#include "screen.h"
+#include "options_handler.h"
+#include "data_analysis.h"
+#include "i2s.h"
 
-//#define DEBUG_SERIAL
-//#define DEBUG_BUFF
-#define DELAY 1000
+// for swap, abs functions in Nokia5110DisplayManager
+#include <algorithm>
 
-// Width and height of sprite
-#define WIDTH  240
-#define HEIGHT 280
+// #include "Nokia5110DisplayManager.h"
 
-#define ADC_CHANNEL   ADC1_CHANNEL_5  // GPIO33
-#define NUM_SAMPLES   1000            // number of samples
-#define I2S_NUM         (0)
-#define BUFF_SIZE 50000
-#define B_MULT BUFF_SIZE/NUM_SAMPLES
-#define BUTTON_Ok        32
-#define BUTTON_Plus        15
-#define BUTTON_Minus        35
-#define BUTTON_Back        34
+// TFT_eSPI    tft = TFT_eSPI();         // Declare object "tft"
 
-TFT_eSPI    tft = TFT_eSPI();         // Declare object "tft"
-
-TFT_eSprite spr = TFT_eSprite(&tft);  // Declare Sprite object "spr" with pointer to "tft" object
-
-
+// TFT_eSprite spr = TFT_eSprite(&tft);  // Declare Sprite object "spr" with pointer to "tft" object
 
 esp_adc_cal_characteristics_t adc_chars;
 
@@ -42,26 +34,6 @@ float offset = 0;
 float toffset = 0;
 uint8_t current_filter = 1;
 
-//options handler
-enum Option {
-  None,
-  Autoscale,
-  Vdiv,
-  Sdiv,
-  Offset,
-  TOffset,
-  Filter,
-  Stop,
-  Mode,
-  Single,
-  Clear,
-  Reset,
-  Probe,
-  UpdateF,
-  Cursor1,
-  Cursor2
-};
-
 int8_t volts_index = 0;
 
 int8_t tscale_index = 0;
@@ -70,9 +42,9 @@ uint8_t opt = None;
 
 bool menu = false;
 bool info = true;
-bool set_value  = false;
+bool set_value = false;
 
-float RATE = 1000; //in ksps --> 1000 = 1Msps
+float RATE = 1000; // in ksps --> 1000 = 1Msps
 
 bool auto_scale = false;
 
@@ -90,161 +62,206 @@ bool data_trigger = false;
 bool updating_screen = false;
 bool new_data = false;
 bool menu_action = false;
-uint8_t digital_wave_option = 0; //0-auto | 1-analog | 2-digital data (SERIAL/SPI/I2C/etc)
-int btnok,btnpl,btnmn,btnbk;
-void IRAM_ATTR btok()
-{
-  btnok = 1;
-}
-void IRAM_ATTR btplus()
-{
-  btnpl = 1;
-}
-void IRAM_ATTR btminus()
-{
-  btnmn = 1;
-}
-void IRAM_ATTR btback()
-{
-  btnbk = 1;
-}
-void setup() {
-  Serial.begin(115200);
+uint8_t digital_wave_option = 0; // 0-auto | 1-analog | 2-digital data (SERIAL/SPI/I2C/etc)
+int btnok, btnpl, btnmn, btnbk;
 
-  configure_i2s(1000000);
+// nokia 5110 library initialization
+// Adafruit_PCD8544(int8_t sclk_pin, int8_t din_pin, int8_t dc_pin,
+//  int8_t cs_pin, int8_t rst_pin);
+Adafruit_PCD8544 display = Adafruit_PCD8544(22, 23, 19, 18, 5);
 
-  setup_screen();
+void IRAM_ATTR btok() {
+    btnok = 1;
+}
 
-  pinMode(BUTTON_Ok , INPUT);
-  pinMode(BUTTON_Plus , INPUT);
-  pinMode(BUTTON_Minus , INPUT);
-  pinMode(BUTTON_Back , INPUT);
-  attachInterrupt(BUTTON_Ok, btok, RISING);
-  attachInterrupt(BUTTON_Plus, btplus, RISING);
-  attachInterrupt(BUTTON_Minus, btminus, RISING);
-  attachInterrupt(BUTTON_Back, btback, RISING);
+void IRAM_ATTR btplus() {
+    btnpl = 1;
+}
 
-  characterize_adc();
+void IRAM_ATTR btminus() {
+    btnmn = 1;
+}
+
+void IRAM_ATTR btback() {
+    btnbk = 1;
+}
+
+Nokia5110DisplayManager spr;
+int data[LCD_WIDTH] = {0};
+
+#pragma region Debug_Buffer
 #ifdef DEBUG_BUF
-  debug_buffer();
+void debug_buffer()
+{
+  ADC_Sampling();
+  i2s_adc_disable(I2S_NUM_0);
+  delay(1000);
+  for (uint32_t i = 0; i < B_MULT * NUM_SAMPLES; i++)
+  {
+    for (int j = 0; j < 1; j++)
+    {
+      Serial.println(i2s_buff[i]);
+    }
+    delay(5);
+  }
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  i2s_adc_enable(I2S_NUM_0);
+  while (1)
+    ;
+}
+#endif
+#pragma endregion
+
+#pragma region ADC
+
+void characterize_adc() {
+    esp_adc_cal_characterize(
+            (adc_unit_t) ADC_UNIT_1,
+            (adc_atten_t) ADC_CHANNEL,
+            (adc_bits_width_t) ADC_WIDTH_BIT_12,
+            1100,
+            &adc_chars);
+}
+
+#pragma endregion
+
+
+#pragma region Start
+
+void setup() {
+    Serial.begin(115200);
+
+    configure_i2s(1000000);
+
+    spr = Nokia5110DisplayManager();
+    spr.clear_sprite();
+    spr.push_sprite(&display); // display is in esp32_oscilloscope.ino
+
+    pinMode(BUTTON_Ok, INPUT_PULLUP);
+    pinMode(BUTTON_Plus, INPUT_PULLUP);
+    pinMode(BUTTON_Minus, INPUT_PULLUP);
+    pinMode(BUTTON_Back, INPUT_PULLUP);
+    attachInterrupt(BUTTON_Ok, btok, RISING);
+    attachInterrupt(BUTTON_Plus, btplus, RISING);
+    attachInterrupt(BUTTON_Minus, btminus, RISING);
+    attachInterrupt(BUTTON_Back, btback, RISING);
+
+    characterize_adc();
+#ifdef DEBUG_BUF
+    debug_buffer();
 #endif
 
-  xTaskCreatePinnedToCore(
-    core0_task,
-    "menu_handle",
-    10000,  /* Stack size in words */
-    NULL,  /* Task input parameter */
-    0,  /* Priority of the task */
-    &task_menu,  /* Task handle. */
-    0); /* Core where the task should run */
+    xTaskCreatePinnedToCore(
+            core0_task,
+            "menu_handle",
+            10000,      /* Stack size in words */
+            NULL,       /* Task input parameter */
+            0,          /* Priority of the task */
+            &task_menu, /* Task handle. */
+            0);         /* Core where the task should run */
 
-  xTaskCreatePinnedToCore(
-    core1_task,
-    "adc_handle",
-    10000,  /* Stack size in words */
-    NULL,  /* Task input parameter */
-    3,  /* Priority of the task */
-    &task_adc,  /* Task handle. */
-    1); /* Core where the task should run */
+    xTaskCreatePinnedToCore(
+            core1_task,
+            "adc_handle",
+            10000,     /* Stack size in words */
+            NULL,      /* Task input parameter */
+            3,         /* Priority of the task */
+            &task_adc, /* Task handle. */
+            1);        /* Core where the task should run */
 }
 
+void core0_task(void *pvParameters) {
 
-void core0_task( void * pvParameters ) {
+    (void) pvParameters;
 
-  (void) pvParameters;
+    for (;;) {
+        menu_handler();
 
-  for (;;) {
-    menu_handler();
+        if (new_data || menu_action) {
+            new_data = false;
+            menu_action = false;
 
-    if (new_data || menu_action) {
-      new_data = false;
-      menu_action = false;
+            updating_screen = true;
+            update_screen(i2s_buff, RATE);
+            updating_screen = false;
+            vTaskDelay(pdMS_TO_TICKS(10));
+            //Serial.println("CORE0");
+        }
 
-      updating_screen = true;
-      update_screen(i2s_buff, RATE);
-      updating_screen = false;
-      vTaskDelay(pdMS_TO_TICKS(10));
-      Serial.println("CORE0");
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-
 }
 
-void core1_task( void * pvParameters ) {
+void core1_task(void *pvParameters) {
 
-  (void) pvParameters;
+    (void) pvParameters;
 
-  for (;;) {
-    if (!single_trigger) {
-      while (updating_screen) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-      }
-      if (!stop) {
-        if (stop_change) {
-          i2s_adc_enable(I2S_NUM_0);
-          stop_change = false;
-        }
-        ADC_Sampling(i2s_buff);
-        new_data = true;
-      }
-      else {
-        if (!stop_change) {
-          i2s_adc_disable(I2S_NUM_0);
-          i2s_zero_dma_buffer(I2S_NUM_0);
-          stop_change = true;
-        }
-      }
-      Serial.println("CORE1");
-      vTaskDelay(pdMS_TO_TICKS(300));
-    }
-    else {
-      float old_mean = 0;
-      while (single_trigger) {
-        stop = true;
-        ADC_Sampling(i2s_buff);
-        float mean = 0;
-        float max_v, min_v;
-        peak_mean(i2s_buff, BUFF_SIZE, &max_v, &min_v, &mean);
-
-        //signal captured (pp > 0.4V || changing mean > 0.2V) -> DATA ANALYSIS
-        if ((old_mean != 0 && fabs(mean - old_mean) > 0.2) || to_voltage(max_v) - to_voltage(min_v) > 0.05) {
-          float freq = 0;
-          float period = 0;
-          uint32_t trigger0 = 0;
-          uint32_t trigger1 = 0;
-
-          //if analog mode OR auto mode and wave recognized as analog
-          bool digital_data = !false;
-          if (digital_wave_option == 1) {
-            trigger_freq_analog(i2s_buff, RATE, mean, max_v, min_v, &freq, &period, &trigger0, &trigger1);
-          }
-          else if (digital_wave_option == 0) {
-            digital_data = digital_analog(i2s_buff, max_v, min_v);
-            if (!digital_data) {
-              trigger_freq_analog(i2s_buff, RATE, mean, max_v, min_v, &freq, &period, &trigger0, &trigger1);
+    for (;;) {
+        if (!single_trigger) {
+            while (updating_screen) {
+                vTaskDelay(pdMS_TO_TICKS(1));
             }
-            else {
-              trigger_freq_digital(i2s_buff, RATE, mean, max_v, min_v, &freq, &period, &trigger0);
+            if (!stop) {
+                if (stop_change) {
+                    i2s_adc_enable(I2S_NUM_0);
+                    stop_change = false;
+                }
+                ADC_Sampling(i2s_buff);
+                new_data = true;
+            } else {
+                if (!stop_change) {
+                    i2s_adc_disable(I2S_NUM_0);
+                    i2s_zero_dma_buffer(I2S_NUM_0);
+                    stop_change = true;
+                }
             }
-          }
-          else {
-            trigger_freq_digital(i2s_buff, RATE, mean, max_v, min_v, &freq, &period, &trigger0);
-          }
+            Serial.println("CORE1");
+            vTaskDelay(pdMS_TO_TICKS(300));
+        } else {
+            float old_mean = 0;
+            while (single_trigger) {
+                stop = true;
+                ADC_Sampling(i2s_buff);
+                float mean = 0;
+                float max_v, min_v;
+                peak_mean(i2s_buff, BUFF_SIZE, &max_v, &min_v, &mean);
 
-          single_trigger = false;
-          new_data = true;
-          Serial.println("Single GOT");
-          //return to normal execution in stop mode
+                // signal captured (pp > 0.4V || changing mean > 0.2V) -> DATA ANALYSIS
+                if ((old_mean != 0 && fabs(mean - old_mean) > 0.2) || to_voltage(max_v) - to_voltage(min_v) > 0.05) {
+                    float freq = 0;
+                    float period = 0;
+                    uint32_t trigger0 = 0;
+                    uint32_t trigger1 = 0;
+
+                    // if analog mode OR auto mode and wave recognized as analog
+                    bool digital_data = !false;
+                    if (digital_wave_option == 1) {
+                        trigger_freq_analog(i2s_buff, RATE, mean, max_v, min_v, &freq, &period, &trigger0, &trigger1);
+                    } else if (digital_wave_option == 0) {
+                        digital_data = digital_analog(i2s_buff, max_v, min_v);
+                        if (!digital_data) {
+                            trigger_freq_analog(i2s_buff, RATE, mean, max_v, min_v, &freq, &period, &trigger0,
+                                                &trigger1);
+                        } else {
+                            trigger_freq_digital(i2s_buff, RATE, mean, max_v, min_v, &freq, &period, &trigger0);
+                        }
+                    } else {
+                        trigger_freq_digital(i2s_buff, RATE, mean, max_v, min_v, &freq, &period, &trigger0);
+                    }
+
+                    single_trigger = false;
+                    new_data = true;
+                    Serial.println("Single GOT");
+                    // return to normal execution in stop mode
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(1)); // time for the other task to start (low priorit)
+            }
+            vTaskDelay(pdMS_TO_TICKS(300));
         }
-
-        vTaskDelay(pdMS_TO_TICKS(1));   //time for the other task to start (low priorit)
-
-      }
-      vTaskDelay(pdMS_TO_TICKS(300));
     }
-  }
 }
 
 void loop() {}
+
+#pragma endregion
